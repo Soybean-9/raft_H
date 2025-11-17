@@ -7,11 +7,13 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"bytes"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -87,14 +89,16 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// persistent state: currentTerm, votedFor, logs
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	// tester.Persister has SaveStateAndSnapshot in many labs; if yours has Save then adapt.
+	// Use SaveStateAndSnapshot(state, snapshot) with nil snapshot for now.
+	rf.persister.Save(data, rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -102,19 +106,21 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+		// decode error -> ignore (or log)
+		return
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.logs = logs
+	// after restore, set commit/lastApplied to firstLog index (dummy)
+	rf.commitIndex = rf.getFirstLog().Index
+	rf.lastApplied = rf.getFirstLog().Index
 }
 
 // how many bytes in Raft's persisted log?
@@ -129,8 +135,26 @@ func (rf *Raft) PersistBytes() int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	firstIdx := rf.getFirstLog().Index
+	if index <= firstIdx || index > rf.getLastLog().Index {
+		return
+	}
+	// trim logs up to index, keep a dummy at position 0
+	rf.logs = shrinkEntries(rf.logs[index-firstIdx:])
+	// dummy entry at index
+	rf.logs[0].Command = nil
+	// save state and snapshot
+	// encode state (same as persist)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	state := w.Bytes()
 
+	rf.persister.Save(state, snapshot)
 }
 
 // example RequestVote RPC arguments structure.
@@ -435,9 +459,41 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 不是 leader：保持原样返回
+	if rf.state != Leader {
+		isLeader = false
+		return index, term, isLeader
+	}
+
+	// leader：准备返回值
+	term = rf.currentTerm
+	index = rf.getLastLog().Index + 1
+
+	// 1. 添加新的 log entry
+	newEntry := LogEntry{
+		Command: command,
+		Term:    term,
+		Index:   index,
+	}
+	rf.logs = append(rf.logs, newEntry)
+	rf.persist()
+
+	// 2. 更新 leader 自己的 matchIndex / nextIndex
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+
+	// 3. 唤醒 replicator，让各节点开始同步日志
+	for peer := range rf.peers {
+		if peer != rf.me {
+			rf.replicatorCond[peer].Signal()
+		}
+	}
 
 	return index, term, isLeader
+
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
